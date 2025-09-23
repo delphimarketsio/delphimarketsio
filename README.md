@@ -1,3 +1,8 @@
+[![Smart Contract CI](https://github.com/delphimarketsio/delphimarketsio/actions/workflows/smart-contract.yml/badge.svg)](https://github.com/delphimarketsio/delphimarketsio/actions/workflows/smart-contract.yml)
+[![Frontend CI](https://github.com/delphimarketsio/delphimarketsio/actions/workflows/frontend.yml/badge.svg)](https://github.com/delphimarketsio/delphimarketsio/actions/workflows/frontend.yml)
+[![Deploy Nginx Config](https://github.com/delphimarketsio/delphimarketsio/actions/workflows/deploy-nginx.yml/badge.svg)](https://github.com/delphimarketsio/delphimarketsio/actions/workflows/deploy-nginx.yml)
+[![CI/CD Deploy](https://github.com/delphimarketsio/delphimarketsio/actions/workflows/deploy.yml/badge.svg)](https://github.com/delphimarketsio/delphimarketsio/actions/workflows/deploy.yml)
+
 # Delphi Markets
 
 Delphi Markets — a lightweight prediction markets dApp on Solana. Create and share binary markets via simple links, stake SOL on outcomes, and settle transparently on-chain.
