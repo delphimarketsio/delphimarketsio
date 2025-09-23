@@ -1,0 +1,88 @@
+name: Deploy Nginx Config
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: "Target environment (testing, staging, production)"
+        required: true
+        type: environment
+        default: staging
+      server_host:
+        description: 'Server host (overrides SERVER_HOST secret)'
+        required: false
+      server_user:
+        description: 'SSH user (overrides SERVER_USER secret)'
+        required: false
+  push:
+    tags:
+      - 'v*.*.*'
+
+concurrency:
+  # Prevent overlapping deployments. Scope by workflow, ref and resolved environment.
+  group: deploy-nginx-${{ github.workflow }}-${{ github.ref }}-${{ github.event_name == 'workflow_dispatch' && inputs.environment || 'production' }}
+  cancel-in-progress: true
+
+jobs:
+  deploy-nginx-config:
+    runs-on: ubuntu-latest
+    environment: "${{ github.event_name == 'workflow_dispatch' && inputs.environment || 'production' }}"
+    env:
+      SERVER_HOST: ${{ github.event.inputs.server_host != '' && github.event.inputs.server_host || secrets.SERVER_HOST }}
+      SERVER_USER: ${{ github.event.inputs.server_user != '' && github.event.inputs.server_user || secrets.SERVER_USER }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Start SSH agent and add key
+        uses: webfactory/ssh-agent@v0.9.0
+        with:
+          ssh-private-key: ${{ secrets.SERVER_SSH_PRIVATE_KEY }}
+
+      - name: Add server to known_hosts
+        run: |
+          ssh-keyscan -H "$SERVER_HOST" >> ~/.ssh/known_hosts
+
+      - name: Upload nginx configs
+        run: |
+          scp infra/nginx/default.conf "$SERVER_USER@$SERVER_HOST:~/default.conf"
+          scp infra/nginx/security-headers.conf "$SERVER_USER@$SERVER_HOST:~/security-headers.conf"
+
+      - name: Install configs in conf.d, test and reload Nginx
+        run: |
+          ssh "$SERVER_USER@$SERVER_HOST" <<'EOF'
+          set -euo pipefail
+          # Ensure conf.d exists and install as default.conf to override the default server
+          sudo mkdir -p /etc/nginx/conf.d
+          # Place the shared headers include first so the main config can include it
+          sudo mv -f ~/security-headers.conf /etc/nginx/conf.d/security-headers.conf
+          sudo mv -f ~/default.conf /etc/nginx/conf.d/default.conf
+
+          # Some included configs reference cache dirs (e.g., /var/cache/nginx/rss). Ensure they exist
+          if [ -d /var/cache/nginx ]; then
+            sudo mkdir -p /var/cache/nginx/rss
+            # Set ownership to nginx user if it exists, else www-data if exists, otherwise leave root
+            if id nginx >/dev/null 2>&1; then sudo chown -R nginx:nginx /var/cache/nginx/rss; \
+            elif id www-data >/dev/null 2>&1; then sudo chown -R www-data:www-data /var/cache/nginx/rss; fi
+          else
+            # Fallback create entire hierarchy
+            sudo mkdir -p /var/cache/nginx/rss
+          fi
+
+          if command -v nginx >/dev/null 2>&1; then
+            sudo nginx -t
+          else
+            echo "nginx binary not found" >&2
+            exit 1
+          fi
+          # Try both systemctl and service for broader compatibility
+          if command -v systemctl >/dev/null 2>&1; then
+            sudo systemctl reload nginx
+          else
+            sudo service nginx reload
+          fi
+          EOF
+
+      - name: Done
+        run: echo "Nginx conf.d/default.conf deployed and Nginx reloaded on $SERVER_HOST"
+

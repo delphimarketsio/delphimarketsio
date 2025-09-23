@@ -1,0 +1,36 @@
+delphimarkets.io Source-Available License (DMSAL)
+Version 1.0 — September 23, 2025
+
+Copyright (c) 2025 delphimarkets.io (contact: delphimarkets.io@proton.me)
+
+1. Grant of Permission
+
+The source code contained in this repository (“the Software”) is made available for review and auditing purposes only. Unless you have been granted express written permission by delphimarkets.io, you have no rights to use, modify, copy, distribute, or deploy the Software in any form.
+
+2. Authorized Use
+
+Only delphimarkets.io and third parties who have received an explicit, written license grant from delphimarkets.io are permitted to use, modify, copy, or distribute the Software. All such grants must be individually negotiated and explicitly documented.
+
+3. Prohibited Actions
+
+Without prior written authorization from delphimarkets.io, you may not:
+
+Run or deploy the Software in any environment (production, development, testing, or otherwise).
+
+Copy, fork, modify, or make derivative works of the Software.
+
+Distribute or sublicense the Software to any third party.
+
+Use any part of the Software for commercial, academic, or personal purposes.
+
+4. Attribution and Proprietary Rights
+
+The Software remains proprietary to delphimarkets.io. Making the source available does not transfer ownership or grant implied rights. All copyright, trademark, and database rights are retained.
+
+5. No Warranty
+
+The Software is provided “as-is” without warranty of any kind, express or implied. delphimarkets.io is not liable for any damages or losses arising from accessing or reviewing the Software.
+
+6. Termination
+
+Any unauthorized use of the Software automatically terminates all rights granted under this License and may result in legal action.

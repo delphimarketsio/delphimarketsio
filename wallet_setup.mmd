@@ -1,0 +1,57 @@
+---
+title: DelphiMarkets Prediction Markets Platform Wallet Architecture
+---
+%% Mermaid diagram describing wallet relationships
+flowchart TB
+
+    %% Nodes
+    SC["On-Chain Program<br/>(Smart Contract / Executable)<br/>Pubkey: Program ID"]
+    AUTH["Program Authority Wallet<br/>(Upgrade + Config + Platform Fee Recipient)"]
+    MAIN_STATE[("MainState PDA<br/>Seeds: [MainState::PREFIX_SEED]<br/>Holds global config")] 
+    SOL_VAULT[("SOL Vault PDA<br/>Seeds: [VAULT_SEED]<br/>Ephemeral escrow (pooled stakes + dust)")] 
+    CREATOR["Market Creator Wallet<br/>(Claims creator fee)"]
+    BIZ_EXP["Business Ops Wallet<br/>(Infra / Cloud / Salaries)"]
+    REVENUE["Revenue Consolidation Wallet<br/>(Cold storage / Treasury)"]
+    EXCHANGE["Exchange Funding Wallet<br/>(Fiat on-ramp / Converts EUR/USD -> SOL)"]
+
+    %% Relationships
+    AUTH -->|"initialize"| MAIN_STATE
+    AUTH -->|"fund rent-exempt"| SOL_VAULT
+    SC -->|"derives & validates"| MAIN_STATE
+    SC -->|"uses"| SOL_VAULT
+
+    %% Resolution-time fee extraction
+    SOL_VAULT -->|"platform fee (set_winner)"| AUTH
+    SOL_VAULT -->|"creator fee (claim_creator_fee)"| CREATOR
+
+    %% Participant payouts (principal + profit share) happen via claim instructions pulling from vault
+    SOL_VAULT -->|"claims (winner payouts)"| SC
+
+    %% Post-resolution treasury & ops management
+    AUTH -->|"operational budgets"| BIZ_EXP
+    AUTH -->|"periodic revenue sweep"| REVENUE
+
+    %% Fiat on-ramp funding (one-directional)
+    EXCHANGE -->|"initial SOL funding"| AUTH
+    EXCHANGE -->|"direct expense top-up"| BIZ_EXP
+
+    %% Dust (rounding remainder) stays in SOL_VAULT until swept
+    SOL_VAULT -. "dust remainder" .- SOL_VAULT
+
+    %% Style & Classes
+    classDef pda fill:#f0f9ff,stroke:#0ea5e9,stroke-width:1px,color:#0c4a6e;
+    classDef wallet fill:#fefce8,stroke:#d97706,stroke-width:1px,color:#713f12;
+    classDef program fill:#eef2ff,stroke:#6366f1,stroke-width:1px,color:#312e81;
+
+    class MAIN_STATE,SOL_VAULT pda;
+    class AUTH,CREATOR,BIZ_EXP,REVENUE,EXCHANGE wallet;
+    class SC program;
+
+    %% Notes
+    %% Legend removed for clarity: colors differentiate Program (purple), PDAs (blue), Wallets (amber).
+    %% - AUTH: upgrade + config + immediate platform fee sink.
+    %% - CREATOR: claims creator fee on demand.
+    %% - BIZ_EXP: receives budgeted operating transfers from AUTH.
+    %% - REVENUE: receives periodic consolidation sweeps from AUTH for long-term treasury.
+    %% - EXCHANGE: custodial/on-ramp wallet only; sends SOL inward (no inbound flows back for security).
+    %% - Platform fee: immediate; Creator fee: claimed later; Winner claim: principal + pro-rata; Dust: remainder in SOL_VAULT.

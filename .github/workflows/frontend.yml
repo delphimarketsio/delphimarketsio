@@ -1,0 +1,255 @@
+name: Frontend CI
+
+on:
+  push:
+    branches: [ "main" ]
+    paths:
+      - 'frontend/**'
+      - '.github/workflows/frontend.yml'
+  pull_request:
+    branches: [ "main" ]
+    paths:
+      - 'frontend/**'
+      - '.github/workflows/frontend.yml'
+
+concurrency:
+  group: frontend-ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: write  # allow auto-format commit
+  actions: read
+
+env:
+  PROGRAM_NAME: betting_program
+  # Environment to pull IDL/types from for E2E (must match deploy workflow artifacts)
+  ENV_NAME: testing
+
+jobs:
+  static-and-unit:
+    runs-on: ubuntu-latest
+    
+    defaults:
+      run:
+        working-directory: frontend
+
+    strategy:
+      matrix:
+        node-version: [22.15.0]
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 0  # needed so we can push formatting commit
+      
+    - name: Setup Node.js ${{ matrix.node-version }}
+      uses: actions/setup-node@v4
+      with:
+        node-version: ${{ matrix.node-version }}
+        cache: 'yarn'
+        cache-dependency-path: frontend/yarn.lock
+
+    # Require deployed IDL/types like in E2E: fail if not available
+    - name: Find latest deploy run with artifacts
+      id: find_deploy_run
+      uses: actions/github-script@v7
+      with:
+        script: |
+          const owner = context.repo.owner;
+          const repo = context.repo.repo;
+          const workflow_id = '.github/workflows/deploy.yml';
+          const envName = process.env.ENV_NAME;
+          const idlArtifactName = `idl-${envName}`;
+          const typesArtifactName = `generated-types-${envName}`;
+          const runsResp = await github.rest.actions.listWorkflowRuns({ owner, repo, workflow_id, status: 'completed', per_page: 50 });
+          for (const run of runsResp.data.workflow_runs) {
+            // Accept any completed run containing both artifacts (smart contract stage succeeded).
+            const arts = await github.rest.actions.listWorkflowRunArtifacts({ owner, repo, run_id: run.id, per_page: 100 });
+            const names = arts.data.artifacts.map(a => a.name);
+            if (names.includes(idlArtifactName) && names.includes(typesArtifactName)) {
+              core.setOutput('run_id', String(run.id));
+              return;
+            }
+          }
+          core.setFailed(`No successful deploy run found with required artifacts for environment '${envName}'.`);
+
+    - name: Download IDL artifact
+      uses: actions/download-artifact@v4
+      with:
+        name: idl-${{ env.ENV_NAME }}
+        path: frontend_artifacts
+        github-token: ${{ github.token }}
+        run-id: ${{ steps.find_deploy_run.outputs.run_id }}
+
+    - name: Download generated types artifact
+      uses: actions/download-artifact@v4
+      with:
+        name: generated-types-${{ env.ENV_NAME }}
+        path: frontend_artifacts
+        github-token: ${{ github.token }}
+        run-id: ${{ steps.find_deploy_run.outputs.run_id }}
+
+    - name: Copy IDL and types into frontend src
+      run: |
+        mkdir -p src/assets src/types
+        cp ../frontend_artifacts/${{ env.PROGRAM_NAME }}.json src/assets/${{ env.PROGRAM_NAME }}.json
+        cp ../frontend_artifacts/${{ env.PROGRAM_NAME }}.ts src/types/${{ env.PROGRAM_NAME }}.ts
+
+    - name: Verify IDL and types are present
+      run: |
+        set -euo pipefail
+        ASSET_JSON="src/assets/${{ env.PROGRAM_NAME }}.json"
+        TYPES_TS="src/types/${{ env.PROGRAM_NAME }}.ts"
+        [ -s "$ASSET_JSON" ] && [ -s "$TYPES_TS" ] || { echo "Missing required IDL/types files" >&2; exit 1; }
+        
+    - name: Install dependencies
+      run: yarn install --frozen-lockfile
+
+    - name: Run formatter (yarn format)
+      run: yarn format
+
+    - name: Commit & push formatting changes (if any)
+      if: github.event_name == 'push'
+      run: |
+        set -euo pipefail
+        # Stage only modifications/deletions to already tracked files (ignore untracked like frontend_artifacts)
+        git add -u
+        if git diff --cached --quiet; then
+          echo "No formatting changes to commit."
+        else
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git commit -m "chore(format): apply automated formatting [skip ci]"
+          git push
+        fi
+      
+    - name: Type check
+      run: yarn type-check
+      
+    - name: Lint
+      run: yarn lint
+      
+    - name: Run unit tests
+      run: yarn test:unit
+      
+    - name: Build application
+      run: yarn build
+
+  e2e:
+    name: E2E (requires contract artifacts)
+    needs: static-and-unit
+    # Run E2E on pushes to main; skip on PRs by default
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: frontend
+    strategy:
+      matrix:
+        node-version: [22.15.0]
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js ${{ matrix.node-version }}
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node-version }}
+          cache: 'yarn'
+          cache-dependency-path: frontend/yarn.lock
+
+      - name: Install dependencies
+        run: yarn install --frozen-lockfile
+
+      # Fetch IDL/types artifacts from latest successful deploy run for ENV_NAME
+      - name: Find latest deploy run with artifacts
+        id: find_deploy_run
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+            const workflow_id = '.github/workflows/deploy.yml';
+            const envName = process.env.ENV_NAME;
+            const idlArtifactName = `idl-${envName}`;
+            const typesArtifactName = `generated-types-${envName}`;
+            const runsResp = await github.rest.actions.listWorkflowRuns({ owner, repo, workflow_id, status: 'completed', per_page: 50 });
+            for (const run of runsResp.data.workflow_runs) {
+              // Accept any completed run containing both artifacts (smart contract stage succeeded).
+              const arts = await github.rest.actions.listWorkflowRunArtifacts({ owner, repo, run_id: run.id, per_page: 100 });
+              const names = arts.data.artifacts.map(a => a.name);
+              if (names.includes(idlArtifactName) && names.includes(typesArtifactName)) {
+                core.setOutput('run_id', String(run.id));
+                return;
+              }
+            }
+            core.setFailed(`No successful deploy run found with required artifacts for environment '${envName}'.`);
+
+      - name: Download IDL artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: idl-${{ env.ENV_NAME }}
+          path: frontend_artifacts
+          github-token: ${{ github.token }}
+          run-id: ${{ steps.find_deploy_run.outputs.run_id }}
+
+      - name: Download generated types artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: generated-types-${{ env.ENV_NAME }}
+          path: frontend_artifacts
+          github-token: ${{ github.token }}
+          run-id: ${{ steps.find_deploy_run.outputs.run_id }}
+
+      - name: Copy IDL and types into frontend src
+        run: |
+          mkdir -p src/assets src/types
+          cp ../frontend_artifacts/${{ env.PROGRAM_NAME }}.json src/assets/${{ env.PROGRAM_NAME }}.json
+          cp ../frontend_artifacts/${{ env.PROGRAM_NAME }}.ts src/types/${{ env.PROGRAM_NAME }}.ts
+
+      - name: Verify IDL and types are present
+        run: |
+          set -euo pipefail
+          ASSET_JSON="src/assets/${{ env.PROGRAM_NAME }}.json"
+          TYPES_TS="src/types/${{ env.PROGRAM_NAME }}.ts"
+          [ -s "$ASSET_JSON" ] && [ -s "$TYPES_TS" ] || { echo "Missing required IDL/types files" >&2; exit 1; }
+
+      # Compute a weekly salt to force cache refresh every week (ISO week number)
+      - name: Compute weekly cache salt
+        id: week
+        shell: bash
+        run: echo "week=$(date -u +%G-%V)" >> "$GITHUB_OUTPUT"
+
+      # Cache Playwright browser binaries to avoid re-downloading on each run
+      - name: Cache Playwright browsers
+        id: cache-playwright-browsers
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ms-playwright
+          # Rebuild cache when OS, Node version, or dependency graph (incl. Playwright version) changes
+          key: ${{ runner.os }}-playwright-${{ matrix.node-version }}-${{ steps.week.outputs.week }}-${{ hashFiles('frontend/yarn.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-playwright-${{ matrix.node-version }}-${{ steps.week.outputs.week }}-
+
+      # On cache miss, install browsers and OS deps; on cache hit, ensure OS deps only
+      - name: Install Playwright browsers + deps (cache miss)
+        if: steps.cache-playwright-browsers.outputs.cache-hit != 'true'
+        run: npx playwright install --with-deps
+
+      - name: Install Playwright OS deps (cache hit)
+        if: steps.cache-playwright-browsers.outputs.cache-hit == 'true'
+        run: npx playwright install-deps
+
+      - name: Run E2E tests
+        run: yarn test:e2e
+        env:
+          CI: true
+
+      - name: Upload Playwright report
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: playwright-report-${{ matrix.node-version }}
+          path: frontend/playwright-report/
+          retention-days: 30

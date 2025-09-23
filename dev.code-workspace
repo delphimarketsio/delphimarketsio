@@ -1,0 +1,17 @@
+{
+	"folders": [
+		{
+			"path": "frontend",
+			"name": "Frontend"
+		},
+		{
+			"path": "smart_contract/prediction-platform",
+			"name": "Smart Contract"
+		},
+		{
+			"path": ".",
+			"name": "Root"
+		}
+	],
+	"settings": {}
+}

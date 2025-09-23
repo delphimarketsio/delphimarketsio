@@ -1,0 +1,491 @@
+name: CI/CD Deploy
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: "Target environment (testing, staging, production)"
+        required: true
+        type: environment
+        default: staging
+      deploy_contract:
+        description: "Deploy smart contract?"
+        required: true
+        type: boolean
+        default: true
+      deploy_frontend:
+        description: "Deploy frontend?"
+        required: true
+        type: boolean
+        default: true
+      frontend_remote_path:
+        description: "Remote path on server for frontend files"
+        required: false
+        default: "/var/www/prediction-platform"
+      server_host:
+        description: 'Server host (overrides SERVER_HOST secret)'
+        required: false
+      server_user:
+        description: 'SSH user (overrides SERVER_USER secret)'
+        required: false
+      restart_command:
+        description: "Command to run remotely after deploy (leave blank to skip)"
+        required: false
+        default: "sudo systemctl reload nginx"
+  push:
+    tags:
+      - 'v*.*.*'
+
+concurrency:
+  group: deploy-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  deployments: write
+  actions: read
+
+env:
+  ANCHOR_VERSION: 0.31.1
+  SOLANA_VERSION: v2.1.21
+  NODE_VERSION: 22
+  PROGRAM_NAME: betting_program
+
+jobs:
+  decide:
+    runs-on: ubuntu-latest
+    outputs:
+      run_sc: ${{ steps.set.outputs.run_sc }}
+      run_fe: ${{ steps.set.outputs.run_fe }}
+      env_name: ${{ steps.set.outputs.env_name }}
+    steps:
+      - id: set
+        run: |
+          echo "run_sc=${{ github.event_name == 'push' || inputs.deploy_contract }}" >> "$GITHUB_OUTPUT"
+          echo "run_fe=${{ github.event_name == 'push' || inputs.deploy_frontend }}" >> "$GITHUB_OUTPUT"
+          echo "env_name=${{ github.event_name == 'workflow_dispatch' && inputs.environment || 'production' }}" >> "$GITHUB_OUTPUT"
+  smart_contract:
+    needs: decide
+    if: ${{ needs.decide.outputs.run_sc == 'true' }}
+    runs-on: ubuntu-latest
+    environment: ${{ needs.decide.outputs.env_name }}
+    env:
+      ENV_NAME: ${{ needs.decide.outputs.env_name }}
+    defaults:
+      run:
+        working-directory: smart_contract/prediction-platform
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install system deps (cached)
+        uses: awalsh128/cache-apt-pkgs-action@v1
+        with:
+          packages: pkg-config libssl-dev libudev-dev libclang-dev build-essential llvm protobuf-compiler rsync
+          version: 1
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Add Cargo bin to PATH
+        run: echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+
+      - name: Enable sccache
+        uses: mozilla-actions/sccache-action@v0.0.9
+
+      - name: Setup Node 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: yarn
+          cache-dependency-path: smart_contract/prediction-platform/yarn.lock
+
+      - name: Install Yarn deps
+        run: |
+          if [ -f yarn.lock ]; then yarn install --frozen-lockfile; fi
+
+      - name: Cache Solana CLI
+        uses: actions/cache@v4
+        with:
+          path: ~/.local/share/solana
+          key: solana-${{ runner.os }}-${{ env.SOLANA_VERSION }}
+
+      - name: Restore stable program keypair (keeps Program ID constant)
+        env:
+          PROGRAM_KEYPAIR_JSON: ${{ secrets.PROGRAM_KEYPAIR_JSON }}
+        run: |
+          mkdir -p target/deploy
+          if [ -n "$PROGRAM_KEYPAIR_JSON" ]; then
+            echo "$PROGRAM_KEYPAIR_JSON" > target/deploy/${PROGRAM_NAME}-keypair.json
+            chmod 600 target/deploy/${PROGRAM_NAME}-keypair.json
+            echo "Restored ${PROGRAM_NAME}-keypair.json from secret."
+          else
+            echo "WARNING: PROGRAM_KEYPAIR_JSON secret is not set. Anchor will generate a new keypair, changing the Program ID." >&2
+          fi
+
+      - name: Install Solana CLI ${{ env.SOLANA_VERSION }}
+        run: |
+          set -euo pipefail
+          SOL_BIN="$HOME/.local/share/solana/install/active_release/bin/solana"
+          if [ -x "$SOL_BIN" ] && "$SOL_BIN" --version | grep -q "${{ env.SOLANA_VERSION }}"; then
+            echo "Using cached Solana CLI: $($SOL_BIN --version)"
+          else
+            echo "Installing Solana CLI ${SOLANA_VERSION}"
+            sh -c "$(curl -sSfL https://release.anza.xyz/${{ env.SOLANA_VERSION }}/install)"
+          fi
+          # Make Solana available to future steps and this current shell
+          echo "$HOME/.local/share/solana/install/active_release/bin" >> "$GITHUB_PATH"
+          export PATH="$HOME/.local/share/solana/install/active_release/bin:$PATH"
+          solana --version
+
+      - name: Cache Anchor (avm, versions) and Cargo registries
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin/avm
+            ~/.avm
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: anchor-${{ runner.os }}-${{ env.ANCHOR_VERSION }}
+
+      - name: Install Anchor (avm + version ${{ env.ANCHOR_VERSION }})
+        run: |
+          set -euo pipefail
+          if command -v avm >/dev/null 2>&1; then
+            echo "Using cached avm: $(avm --version || true)"
+          else
+            echo "Installing avm (first run will compile; subsequent runs use cache)"
+            cargo install --git https://github.com/coral-xyz/anchor avm --locked --force
+          fi
+          avm install $ANCHOR_VERSION
+          avm use $ANCHOR_VERSION
+          # Ensure anchor shim is on PATH for this and subsequent steps
+          echo "$HOME/.avm/bin" >> "$GITHUB_PATH"
+          export PATH="$HOME/.avm/bin:$PATH"
+          anchor --version
+
+      - name: Sync Anchor keys (updates declare_id! and Anchor.toml)
+        run: |
+          anchor keys sync
+
+      - name: Derive program pubkey for cache key
+        id: derive_pubkey
+        run: |
+          set -euo pipefail
+          KEYFILE="target/deploy/${PROGRAM_NAME}-keypair.json"
+          PUBKEY=""
+          if [ -f "$KEYFILE" ]; then
+            PUBKEY=$(solana-keygen pubkey "$KEYFILE")
+          fi
+          # Fallback: parse declare_id! from program source if key not present
+          if [ -z "$PUBKEY" ]; then
+            if grep -R --include="lib.rs" -E 'declare_id!\("([1-9A-HJ-NP-Za-km-z]{32,44})"\)' programs -n >/dev/null 2>&1; then
+              PUBKEY=$(grep -R --include="lib.rs" -E 'declare_id!\("([1-9A-HJ-NP-Za-km-z]{32,44})"\)' programs | sed -E 's/.*declare_id!\("([^"]+)"\).*/\1/' | head -n1)
+            fi
+          fi
+          if [ -z "$PUBKEY" ]; then
+            PUBKEY="unknown"
+          fi
+          echo "program_pubkey=$PUBKEY" >> "$GITHUB_OUTPUT"
+          echo "Program pubkey for cache key: $PUBKEY"
+
+      - name: Cache program build artifacts (env-aware)
+        uses: actions/cache@v4
+        with:
+          path: |
+            smart_contract/prediction-platform/target
+          key: anchor-target-${{ runner.os }}-${{ env.SOLANA_VERSION }}-${{ env.ENV_NAME }}-${{ steps.derive_pubkey.outputs.program_pubkey }}-${{ hashFiles('smart_contract/prediction-platform/Cargo.lock', 'smart_contract/prediction-platform/Anchor.toml', 'smart_contract/prediction-platform/programs/**/Cargo.toml', 'smart_contract/prediction-platform/programs/**/src/**/*.rs') }}
+          restore-keys: |
+            anchor-target-${{ runner.os }}-${{ env.SOLANA_VERSION }}-${{ env.ENV_NAME }}-${{ steps.derive_pubkey.outputs.program_pubkey }}-
+
+      - name: Anchor build
+        env:
+          RUSTC_WRAPPER: sccache
+          SCCACHE_GHA_ENABLED: "true"
+        run: |
+          anchor build --skip-lint
+
+      - name: Upload IDL
+        uses: actions/upload-artifact@v4
+        with:
+          name: idl-${{ env.ENV_NAME }}
+          path: smart_contract/prediction-platform/target/idl/${{ env.PROGRAM_NAME }}.json
+
+      - name: Upload generated types
+        uses: actions/upload-artifact@v4
+        with:
+          name: generated-types-${{ env.ENV_NAME }}
+          path: smart_contract/prediction-platform/target/types/${{ env.PROGRAM_NAME }}.ts
+
+      - name: Upload program deployables
+        uses: actions/upload-artifact@v4
+        with:
+          name: program-artifacts
+          path: |
+            smart_contract/prediction-platform/target/deploy/${{ env.PROGRAM_NAME }}.so
+            smart_contract/prediction-platform/target/deploy/${{ env.PROGRAM_NAME }}-keypair.json
+
+      - name: Set RPC_URL based on environment
+        run: |
+          case "${{ env.ENV_NAME }}" in
+            testing|staging)
+              echo "Using Solana devnet"
+              echo "RPC_URL=https://api.devnet.solana.com" >> "$GITHUB_ENV"
+              ;;
+            production)
+              echo "Using Solana mainnet-beta"
+              echo "RPC_URL=https://api.mainnet-beta.solana.com" >> "$GITHUB_ENV"
+              ;;
+            *)
+              echo "Unknown environment; defaulting RPC_URL to devnet"
+              echo "RPC_URL=https://api.devnet.solana.com" >> "$GITHUB_ENV"
+              ;;
+          esac
+
+      - name: Configure wallet and Solana
+        env:
+          SOLANA_WALLET_KEY: ${{ secrets.SOLANA_WALLET_KEY }}
+        run: |
+          # Write wallet keypair to file
+          printf '%s' "$SOLANA_WALLET_KEY" > $GITHUB_WORKSPACE/id.json
+          chmod 600 $GITHUB_WORKSPACE/id.json
+          # Configure Solana CLI
+          solana config set --url "$RPC_URL"
+          solana config set --keypair $GITHUB_WORKSPACE/id.json
+          echo "Solana config:" && solana config get
+          echo "Deployer pubkey:" && solana address
+
+      - name: Anchor deploy
+        run: |
+          export ANCHOR_WALLET="$GITHUB_WORKSPACE/id.json"
+          export ANCHOR_PROVIDER_URL="$RPC_URL"
+          # Use artifacts built earlier in this job
+          anchor deploy --provider.cluster "$RPC_URL" --provider.wallet "$GITHUB_WORKSPACE/id.json"
+
+      - name: Initialize main state (idempotent)
+        if: success()
+        run: |
+          export ANCHOR_WALLET="$GITHUB_WORKSPACE/id.json"
+          export ANCHOR_PROVIDER_URL="$RPC_URL"
+          # Use yarn if lockfile exists; otherwise use npm
+          if [ -f yarn.lock ]; then
+            yarn init:main
+          else
+            npm run init:main
+          fi
+
+  build-frontend:
+    needs: [decide, smart_contract]
+    # Run when FE is requested or on tag push; accept 'skipped' smart_contract
+    if: ${{ always() }} && ${{ needs.decide.outputs.run_fe == 'true' && (needs.smart_contract.result == 'success' || needs.smart_contract.result == 'skipped') }}
+    runs-on: ubuntu-latest
+    env:
+      ENV_NAME: ${{ needs.decide.outputs.env_name }}
+    defaults:
+      run:
+        working-directory: frontend
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: yarn
+          cache-dependency-path: frontend/yarn.lock
+      # Pull IDL and generated types from the smart_contract job and place into frontend source
+      - name: Download IDL artifact
+        if: needs.smart_contract.result == 'success'
+        uses: actions/download-artifact@v4
+        with:
+          name: idl-${{ env.ENV_NAME }}
+          path: frontend_artifacts
+      - name: Download generated types artifact
+        if: needs.smart_contract.result == 'success'
+        uses: actions/download-artifact@v4
+        with:
+          name: generated-types-${{ env.ENV_NAME }}
+          path: frontend_artifacts
+      - name: Copy IDL and types into frontend src
+        if: needs.smart_contract.result == 'success'
+        run: |
+          set -euo pipefail
+          mkdir -p src/assets src/types
+          cp ../frontend_artifacts/${{ env.PROGRAM_NAME }}.json src/assets/${{ env.PROGRAM_NAME }}.json
+          cp ../frontend_artifacts/${{ env.PROGRAM_NAME }}.ts src/types/${{ env.PROGRAM_NAME }}.ts
+
+      # Fallback: smart_contract skipped — fetch IDL/types from the latest successful run for same environment
+      - name: Find previous successful run with artifacts
+        if: needs.smart_contract.result != 'success'
+        id: find_previous_run
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+            const workflow_id = '.github/workflows/deploy.yml';
+            const envName = process.env.ENV_NAME;
+            const idlArtifactName = `idl-${envName}`;
+            const typesArtifactName = `generated-types-${envName}`;
+            // Get recent completed runs for this workflow
+            const runsResp = await github.rest.actions.listWorkflowRuns({
+              owner, repo, workflow_id, status: 'completed', per_page: 50
+            });
+            for (const run of runsResp.data.workflow_runs) {
+              // We no longer require overall workflow success, only presence of both artifacts.
+              // Artifacts are only uploaded if the smart_contract job succeeded, so their presence
+              // implies the smart contract build/deploy stage was successful even if later jobs failed.
+              const arts = await github.rest.actions.listWorkflowRunArtifacts({ owner, repo, run_id: run.id, per_page: 100 });
+              const names = arts.data.artifacts.map(a => a.name);
+              if (names.includes(idlArtifactName) && names.includes(typesArtifactName)) {
+                core.setOutput('run_id', String(run.id));
+                return;
+              }
+            }
+            core.setOutput('run_id', '');
+      - name: Download previous IDL artifact
+        if: needs.smart_contract.result != 'success' && steps.find_previous_run.outputs.run_id != ''
+        uses: actions/download-artifact@v4
+        with:
+          name: idl-${{ env.ENV_NAME }}
+          path: frontend_artifacts
+          github-token: ${{ github.token }}
+          run-id: ${{ steps.find_previous_run.outputs.run_id }}
+      - name: Download previous generated types artifact
+        if: needs.smart_contract.result != 'success' && steps.find_previous_run.outputs.run_id != ''
+        uses: actions/download-artifact@v4
+        with:
+          name: generated-types-${{ env.ENV_NAME }}
+          path: frontend_artifacts
+          github-token: ${{ github.token }}
+          run-id: ${{ steps.find_previous_run.outputs.run_id }}
+      - name: Copy IDL and types from previous run into frontend src
+        if: needs.smart_contract.result != 'success' && steps.find_previous_run.outputs.run_id != ''
+        run: |
+          set -euo pipefail
+          mkdir -p src/assets src/types
+          cp ../frontend_artifacts/${{ env.PROGRAM_NAME }}.json src/assets/${{ env.PROGRAM_NAME }}.json
+          cp ../frontend_artifacts/${{ env.PROGRAM_NAME }}.ts src/types/${{ env.PROGRAM_NAME }}.ts
+      - name: Verify IDL and types are present
+        run: |
+          set -euo pipefail
+          ASSET_JSON="src/assets/${{ env.PROGRAM_NAME }}.json"
+          TYPES_TS="src/types/${{ env.PROGRAM_NAME }}.ts"
+          if [ ! -s "$ASSET_JSON" ] || [ ! -s "$TYPES_TS" ]; then
+            echo "ERROR: Required files not found or empty:" >&2
+            [ -s "$ASSET_JSON" ] || echo " - Missing $ASSET_JSON" >&2
+            [ -s "$TYPES_TS" ] || echo " - Missing $TYPES_TS" >&2
+            echo "Hint: Run the smart_contract job or ensure previous artifacts exist for environment '${ENV_NAME}'." >&2
+            exit 1
+          fi
+      - name: Install dependencies
+        run: yarn install --frozen-lockfile
+      - name: Build
+        run: |
+          case "${{ env.ENV_NAME }}" in
+            testing)
+              yarn type-check
+              yarn build-only:testing
+              ;;
+            staging)
+              yarn type-check
+              yarn build-only:staging
+              ;;
+            production)
+              yarn build
+              ;;
+            *)
+              echo "Unknown ENV_NAME=${{ env.ENV_NAME }}; running default build"
+              yarn build
+              ;;
+          esac
+      - name: Upload dist
+        uses: actions/upload-artifact@v4
+        with:
+          name: frontend-dist
+          path: frontend/dist
+
+  deploy-frontend:
+    name: Deploy Frontend
+    needs: [decide, build-frontend]
+    if: ${{ always() }} && ${{ needs.build-frontend.result == 'success' }}
+    runs-on: ubuntu-latest
+    environment: ${{ needs.decide.outputs.env_name }}
+    env:
+      SERVER_HOST: ${{ github.event.inputs.server_host != '' && github.event.inputs.server_host || secrets.SERVER_HOST }}
+      SERVER_USER: ${{ github.event.inputs.server_user != '' && github.event.inputs.server_user || secrets.SERVER_USER }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: frontend-dist
+          path: dist
+      - name: Setup SSH agent
+        uses: webfactory/ssh-agent@v0.9.0
+        with:
+          ssh-private-key: ${{ secrets.SERVER_SSH_PRIVATE_KEY }}
+      - name: Add server host key
+        run: |
+          mkdir -p ~/.ssh
+          ssh-keyscan -H "$SERVER_HOST" >> ~/.ssh/known_hosts
+      - name: Ensure remote path exists
+        env:
+          REMOTE_PATH: ${{ inputs.frontend_remote_path }}
+        run: |
+          # Create remote directory (with sudo if available), then ensure it's writable by the SSH user
+          ssh "${SERVER_USER}@${SERVER_HOST}" "\
+            if command -v sudo >/dev/null 2>&1; then \
+              sudo mkdir -p '${REMOTE_PATH}' && sudo chown -R ${SERVER_USER}:${SERVER_USER} '${REMOTE_PATH}'; \
+            else \
+              mkdir -p '${REMOTE_PATH}'; \
+            fi"
+      - name: Ensure rsync present (cached)
+        uses: awalsh128/cache-apt-pkgs-action@v1
+        with:
+          packages: rsync
+          version: 1
+      - name: Deploy frontend (rsync or tar fallback)
+        env:
+          REMOTE_PATH: ${{ inputs.frontend_remote_path }}
+        run: |
+          set -euo pipefail
+          echo "Checking for rsync on remote host..."
+          if ssh "${SERVER_USER}@${SERVER_HOST}" "command -v rsync >/dev/null 2>&1"; then
+            echo "Remote rsync already installed. Using rsync for deployment."
+          else
+            echo "Remote rsync missing. Attempting to install..."
+            ssh "${SERVER_USER}@${SERVER_HOST}" '
+              set -e
+              if command -v apk >/dev/null 2>&1; then (command -v sudo >/dev/null 2>&1 && sudo apk add --no-cache rsync) || apk add --no-cache rsync; 
+              elif command -v apt-get >/dev/null 2>&1; then (command -v sudo >/dev/null 2>&1 && sudo apt-get update -y || apt-get update -y) && (command -v sudo >/dev/null 2>&1 && sudo apt-get install -y rsync || apt-get install -y rsync); 
+              elif command -v yum >/dev/null 2>&1; then (command -v sudo >/dev/null 2>&1 && sudo yum install -y rsync || yum install -y rsync); 
+              elif command -v dnf >/dev/null 2>&1; then (command -v sudo >/dev/null 2>&1 && sudo dnf install -y rsync || dnf install -y rsync); 
+              elif command -v pacman >/dev/null 2>&1; then (command -v sudo >/dev/null 2>&1 && sudo pacman -Sy --noconfirm rsync || pacman -Sy --noconfirm rsync); 
+              else echo "No supported package manager found to install rsync (continuing with fallback)."; fi'
+          fi
+
+          if ssh "${SERVER_USER}@${SERVER_HOST}" "command -v rsync >/dev/null 2>&1"; then
+            echo "Running rsync with delete to sync dist -> ${REMOTE_PATH}"
+            rsync -az --delete dist/ "${SERVER_USER}@${SERVER_HOST}:${REMOTE_PATH}/"
+          else
+            echo "FALLBACK: Using tar over SSH (no incremental diff). Remote directory will be cleared first."
+            # Safety guard: refuse to wipe clearly unsafe paths
+            case "$REMOTE_PATH" in
+              ''|'/') echo "Refusing to deploy to unsafe REMOTE_PATH '$REMOTE_PATH'" >&2; exit 1 ;;
+              '/var'|'/var/www') echo "Refusing to wipe high-level directory '$REMOTE_PATH'" >&2; exit 1 ;;
+            esac
+            ssh "${SERVER_USER}@${SERVER_HOST}" "mkdir -p '${REMOTE_PATH}' && find '${REMOTE_PATH}' -mindepth 1 -maxdepth 1 -exec rm -rf {} +"
+            tar -C dist -cf - . | ssh "${SERVER_USER}@${SERVER_HOST}" "tar -C '${REMOTE_PATH}' -xf -"
+            echo "Fallback deploy complete. (Next deploys will try rsync again.)"
+          fi
+      - name: Post-deploy restart (optional)
+        if: ${{ inputs.restart_command != '' }}
+        env:
+          RESTART_CMD: ${{ inputs.restart_command }}
+        run: |
+          ssh "${SERVER_USER}@${SERVER_HOST}" "$RESTART_CMD" || echo "Restart command failed or not needed"
+
+  summary:
+    needs: [smart_contract, deploy-frontend]
+    runs-on: ubuntu-latest
+    if: always()
+    steps:
+      - name: Deployment Summary
+        run: |
+          echo "Smart contract job: ${{ needs.smart_contract.result }}"
+          echo "Frontend job: ${{ needs['deploy-frontend'].result }}"

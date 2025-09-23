@@ -1,0 +1,9 @@
+**/.DS_Store
+key.py
+venv
+wallet-keypair.json
+__pycache__/
+.env
+test-ledger*/
+# Logs of test ledger
+.logs

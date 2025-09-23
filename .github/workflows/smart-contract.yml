@@ -1,0 +1,206 @@
+name: Smart Contract CI
+
+on:
+  push:
+    branches: [ "main" ]
+    paths:
+      - 'smart_contract/**'
+      - '.github/workflows/smart-contract.yml'
+  pull_request:
+    branches: [ "main" ]
+    paths:
+      - 'smart_contract/**'
+      - '.github/workflows/smart-contract.yml'
+
+concurrency:
+  group: smart-contract-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: write  # enable auto-format commit
+
+jobs:
+  build-test:
+    name: Build, Lint, Test
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: smart_contract/prediction-platform
+    env:
+      ANCHOR_VERSION: 0.31.1
+      SOLANA_VERSION: v2.1.21
+      CARGO_TERM_COLOR: always
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install system dependencies (cached)
+        uses: awalsh128/cache-apt-pkgs-action@v1
+        with:
+          packages: pkg-config libssl-dev libudev-dev libclang-dev build-essential llvm protobuf-compiler
+          version: 1
+
+      - name: Setup Rust (stable)
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Add Cargo bin to PATH
+        run: echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+
+      - name: Enable sccache
+        uses: mozilla-actions/sccache-action@v0.0.9
+
+      - name: Cache Cargo build
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git
+            smart_contract/prediction-platform/target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('smart_contract/prediction-platform/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      - name: Setup Node.js 22.x (for Anchor tests)
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22.x
+          cache: yarn
+          cache-dependency-path: smart_contract/prediction-platform/yarn.lock
+
+      - name: Install Yarn dependencies
+        run: |
+          if [ -f yarn.lock ]; then yarn install --frozen-lockfile; else echo "No yarn.lock"; fi
+
+      - name: Run formatter (yarn lint:fix)
+        run: yarn lint:fix
+
+      - name: Commit & push formatting changes (if any)
+        if: github.event_name == 'push'
+        run: |
+          set -euo pipefail
+          git add -u
+          if git diff --cached --quiet; then
+            echo "No formatting changes to commit."
+          else
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git commit -m "chore(format): apply automated formatting [skip ci]"
+            git push
+          fi
+
+      - name: Cache Solana CLI
+        uses: actions/cache@v4
+        with:
+          path: ~/.local/share/solana
+          key: solana-${{ runner.os }}-${{ env.SOLANA_VERSION }}
+
+      - name: Install Solana CLI ${{ env.SOLANA_VERSION }}
+        run: |
+          set -euo pipefail
+          SOL_BIN="$HOME/.local/share/solana/install/active_release/bin/solana"
+          if [ -x "$SOL_BIN" ] && "$SOL_BIN" --version | grep -q "${{ env.SOLANA_VERSION }}"; then
+            echo "Using cached Solana CLI: $($SOL_BIN --version)"
+          else
+            sh -c "$(curl -sSfL https://release.anza.xyz/${{ env.SOLANA_VERSION }}/install)"
+          fi
+          # Make Solana available to future steps and this current shell
+          echo "$HOME/.local/share/solana/install/active_release/bin" >> "$GITHUB_PATH"
+          export PATH="$HOME/.local/share/solana/install/active_release/bin:$PATH"
+          solana --version
+
+      - name: Configure Solana local config
+        run: |
+          solana config set --url localhost
+          solana-keygen new --no-bip39-passphrase --silent --outfile ~/.config/solana/id.json
+
+      - name: Cache Anchor (avm, versions) and Cargo registries
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin/avm
+            ~/.avm
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: anchor-${{ runner.os }}-${{ env.ANCHOR_VERSION }}
+
+      - name: Install Anchor (avm + version ${{ env.ANCHOR_VERSION }})
+        run: |
+          set -euo pipefail
+          if command -v avm >/dev/null 2>&1; then
+            echo "Using cached avm: $(avm --version || true)"
+          else
+            cargo install --git https://github.com/coral-xyz/anchor avm --locked --force
+          fi
+          avm install $ANCHOR_VERSION
+          avm use $ANCHOR_VERSION
+          # Ensure anchor shim is on PATH for this and subsequent steps
+          echo "$HOME/.avm/bin" >> "$GITHUB_PATH"
+          export PATH="$HOME/.avm/bin:$PATH"
+          anchor --version
+
+      - name: Prettier Lint Check
+        run: |
+          if yarn lint; then echo "Lint passed"; else echo "Lint failed"; exit 1; fi
+
+      - name: Cache program build artifacts
+        uses: actions/cache@v4
+        with:
+          path: smart_contract/prediction-platform/target
+          key: anchor-target-${{ runner.os }}-${{ env.SOLANA_VERSION }}-${{ hashFiles('smart_contract/prediction-platform/Cargo.lock', 'smart_contract/prediction-platform/programs/**/Cargo.toml') }}
+          restore-keys: |
+            anchor-target-${{ runner.os }}-${{ env.SOLANA_VERSION }}-
+
+      - name: Build Program(s)
+        env:
+          RUSTC_WRAPPER: sccache
+          SCCACHE_GHA_ENABLED: "true"
+        run: anchor build --skip-lint
+
+      - name: Run Anchor tests (skip rebuild)
+        run: anchor test --skip-build
+        env:
+          RUST_LOG: info
+
+      - name: Upload IDL artifact
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: anchor-idl
+          path: smart_contract/prediction-platform/target/idl/*.json
+          retention-days: 14
+
+      - name: Upload generated TypeScript types
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: anchor-types
+          path: smart_contract/prediction-platform/target/types/**
+          retention-days: 14
+
+  cargo-audit:
+    name: Cargo Audit
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request'
+    defaults:
+      run:
+        working-directory: smart_contract/prediction-platform
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Cache Cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git
+            smart_contract/prediction-platform/target
+          key: ${{ runner.os }}-audit-${{ hashFiles('smart_contract/prediction-platform/Cargo.lock') }}
+      - name: Install cargo-audit
+        run: cargo install cargo-audit --locked
+      - name: Run audit
+        run: cargo audit --deny warnings || true # TODO: Adjust policy later
