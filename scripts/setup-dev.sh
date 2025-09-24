@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 
 # Simple developer bootstrap script
+#  - Installs smart contract (Anchor workspace) JS dependencies (yarn)
+#  - Syncs Anchor program keys (anchor keys sync) before build to ensure declare_id!/Anchor.toml alignment
 #  - Builds Anchor program
 #  - Copies generated IDL + TypeScript types into frontend (src/assets + src/types)
 #  - Installs frontend dependencies with yarn (frozen lockfile)
@@ -63,6 +65,14 @@ require_cmd yarn
 require_cmd bash # for completeness if invoked differently
 
 anchor_build() {
+  log "Installing smart contract JS dependencies (if yarn.lock present)..."
+  (cd "$SC_DIR" && if [[ -f yarn.lock ]]; then yarn install --frozen-lockfile >/dev/null; else log "No yarn.lock in smart contract dir; skipping JS deps install."; fi)
+  log "Syncing Anchor program keys (anchor keys sync)..."
+  if (cd "$SC_DIR" && anchor keys sync >/dev/null 2>&1); then
+    log "Anchor keys synced."
+  else
+    err "Anchor keys sync failed (continuing)." # Non-fatal; build may still proceed
+  fi
   log "Building Anchor program..."
   (cd "$SC_DIR" && anchor build --skip-lint >/dev/null)
   log "Anchor build complete."
