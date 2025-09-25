@@ -284,7 +284,7 @@ const userBets = computed((): BetData[] => {
             (userEntry.account.tokenBalance.toNumber() * losingReserve) / winningSupply
           claimableAmount += userProfit
         }
-        payout = `${(claimableAmount / 1e9).toFixed(3)} SOL`
+        payout = `${(claimableAmount / 1e9).toFixed(4)} SOL`
       } else {
         payout = '0 SOL'
       }
@@ -297,7 +297,7 @@ const userBets = computed((): BetData[] => {
       description: poolData.description,
       myPosition: userEntry ? (userEntry.account.isYes ? 'Yes' : 'No') : undefined,
       amount: userEntry
-        ? `${(userEntry.account.depositedSolAmount.toNumber() / 1e9).toFixed(3)} SOL`
+        ? `${(userEntry.account.depositedSolAmount.toNumber() / 1e9).toFixed(4)} SOL`
         : undefined,
       status,
       participants: [participantsText],
@@ -376,7 +376,7 @@ const filteredBets = computed(() => filterBets(userBets.value))
       <!-- Statistics (authenticated only) -->
       <div
         v-if="workspaceStore.isAuthenticated"
-        class="grid grid-cols-1 md:grid-cols-3 gap-6 mb-10"
+        class="grid grid-cols-1 md:grid-cols-2 gap-6 mb-10"
       >
         <Card>
           <CardHeader class="pb-2">
@@ -401,37 +401,10 @@ const filteredBets = computed(() => filterBets(userBets.value))
                     const amount = bet.amount ? parseFloat(bet.amount.replace(' SOL', '')) : 0
                     return sum + amount
                   }, 0)
-                  .toFixed(1)
+                  .toFixed(4)
               }}
               SOL
             </div>
-          </CardContent>
-        </Card>
-        <Card>
-          <CardHeader class="pb-2">
-            <CardTitle class="text-lg">Win Rate</CardTitle>
-          </CardHeader>
-          <CardContent>
-            <div class="text-3xl font-bold text-[#3B82F6]">
-              {{
-                userBets.filter((bet) => bet.status === 'completed').length > 0
-                  ? Math.round(
-                      (userBets.filter((bet) => bet.status === 'completed' && bet.won === true)
-                        .length /
-                        userBets.filter((bet) => bet.status === 'completed').length) *
-                        100,
-                    ) + '%'
-                  : '--'
-              }}
-            </div>
-            <p class="text-xs text-gray-500 dark:text-gray-400 mt-1">
-              {{
-                userBets.filter((bet) => bet.status === 'completed').length === 0
-                  ? 'No resolved markets yet'
-                  : userBets.filter((bet) => bet.status === 'completed').length +
-                    ' resolved market(s)'
-              }}
-            </p>
           </CardContent>
         </Card>
       </div>
