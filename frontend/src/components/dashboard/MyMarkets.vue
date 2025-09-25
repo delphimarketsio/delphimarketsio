@@ -79,6 +79,20 @@ async function ensureEntry(betId: number) {
   }
 }
 
+// After a user action (e.g., deposit), refresh chain-backed data so the list reflects new state
+async function refreshAfterAction(betId: number) {
+  try {
+    // Force-refresh pool (reserves/liquidity) and entries (participants/volume) for this bet
+    await Promise.all([
+      workspace.getPoolById(betId, { force: true, ttlMs: 0 }),
+      workspace.getAllEntriesForBet(betId, { force: true }),
+      workspace.getUserEntries(undefined, { force: true }),
+    ])
+  } catch (e) {
+    log.warn('post-action refresh failed (MyMarkets)', betId, e)
+  }
+}
+
 async function quickDeposit(
   bet: any, // eslint-disable-line @typescript-eslint/no-explicit-any
   side: 'Yes' | 'No',
@@ -125,6 +139,9 @@ async function quickDeposit(
     toast.success('Position placed.', 'Deposit successful')
     if (side === 'Yes') state.yesAmount = ''
     else state.noAmount = ''
+    // Force-refresh relevant data and ask parent to rebuild lists
+    await refreshAfterAction(bet.id)
+    try { props.onRetry?.() } catch {}
   } catch (e) {
     log.error('mini deposit failed', e)
     toast.error((e as Error)?.message || 'Failed to deposit', 'Transaction failed')
