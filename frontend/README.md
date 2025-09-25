@@ -65,17 +65,28 @@ npm run test:e2e -- --debug
 npm run lint
 ```
 
-## World News Widget (Euronews RSS)
+## World News Widget (Decrypt RSS)
 
-The dashboard includes a light-weight `WorldNewsWidget.vue` component that consumes the Euronews MRSS feed via a same-origin path `/news-feed`.
+The dashboard includes a light-weight `WorldNewsWidget.vue` component that consumes the Decrypt RSS feed via a same-origin path `/news-feed`.
 
 Development:
 
+- Vite dev server proxies `/news-feed` to `https://decrypt.co/feed` (see `vite.config.ts`).
+- No CORS issues in dev since the proxy is same-origin.
+
 Production:
+
+- Nginx proxies `/news-feed` to `https://decrypt.co/feed` with a 5-minute cache (see `infra/nginx/default.conf`).
+- Keep caching to reduce upstream load; adjust durations as needed.
 
 Images:
 
+- Decrypt articles often reference images served via Prismic. The widget pulls the first `<img>` from the description/content when needed.
+- Allowed sources include `https://decrypt.co`, `https://*.decrypt.co`, and `https://images.prismic.io`.
+
 Security Notes:
+
+- CSP is configured in `infra/nginx/security-headers.conf`. Ensure `img-src` includes Decrypt and Prismic domains. No external `connect-src` is used for the feed because it goes through the same-origin proxy.
 
 ## Performance & RPC Usage Controls (Added)
 
