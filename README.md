@@ -92,3 +92,32 @@ RPC_PORT=8899 BIND_ADDR=0.0.0.0 ./scripts/dev.sh --reset
 - Solana CLI with `solana-test-validator`
 - Anchor CLI (`anchor`)
 - Node.js + a package manager (Yarn/Pnpm/NPM)
+
+### One-time (or occasional) bootstrap
+
+If you just cloned the repo or pulled major smart contract changes, run the lightweight setup helper to:
+
+- Build the Anchor program (generates/updates IDL + TypeScript types)
+- Install frontend dependencies with a frozen lockfile
+- Copy the generated IDL + types into `frontend/src/assets` and `frontend/src/types`
+
+```bash
+./scripts/setup-dev.sh
+```
+
+By default it runs the Anchor build and the frontend dependency install in parallel to save time. After completion you can immediately start the combined dev environment with `./scripts/dev.sh`.
+
+Options:
+
+```bash
+./scripts/setup-dev.sh --no-parallel        # Run steps sequentially
+./scripts/setup-dev.sh --program betting_program  # Explicit program name if auto-detect fails
+PROGRAM_NAME=betting_program ./scripts/setup-dev.sh  # Same via environment variable
+```
+
+When would you re-run it?
+- After changing Rust program code (regenerates updated IDL/types)
+- After pulling upstream changes to the smart contract
+- After deleting `frontend/node_modules` or updating lockfiles
+
+If auto-detection of the program fails (e.g., no files yet in `target/idl`), specify `--program <name>` or set `PROGRAM_NAME`.
