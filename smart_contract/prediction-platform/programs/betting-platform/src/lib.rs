@@ -15,7 +15,7 @@ pub mod error;
 use main_state::*;
 use pool::*;
 
-declare_id!("GzPnt6kHRES8xp4C7HWcf3M1d92je2sM6x27LNgBQijk");
+declare_id!("5YY5vAxRUkWLAGRwXxmRngrmuPs2yMmRVLp6mzkvZKSw");
 
 #[program]
 pub mod betting_program {
