@@ -284,7 +284,7 @@ const userBets = computed((): BetData[] => {
             (userEntry.account.tokenBalance.toNumber() * losingReserve) / winningSupply
           claimableAmount += userProfit
         }
-        payout = `${(claimableAmount / 1e9).toFixed(3)} SOL`
+        payout = `${(claimableAmount / 1e9).toFixed(4)} SOL`
       } else {
         payout = '0 SOL'
       }
@@ -297,7 +297,7 @@ const userBets = computed((): BetData[] => {
       description: poolData.description,
       myPosition: userEntry ? (userEntry.account.isYes ? 'Yes' : 'No') : undefined,
       amount: userEntry
-        ? `${(userEntry.account.depositedSolAmount.toNumber() / 1e9).toFixed(3)} SOL`
+        ? `${(userEntry.account.depositedSolAmount.toNumber() / 1e9).toFixed(4)} SOL`
         : undefined,
       status,
       participants: [participantsText],
@@ -401,7 +401,7 @@ const filteredBets = computed(() => filterBets(userBets.value))
                     const amount = bet.amount ? parseFloat(bet.amount.replace(' SOL', '')) : 0
                     return sum + amount
                   }, 0)
-                  .toFixed(1)
+                  .toFixed(4)
               }}
               SOL
             </div>
