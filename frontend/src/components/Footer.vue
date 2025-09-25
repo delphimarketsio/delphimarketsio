@@ -29,6 +29,24 @@ const year = new Date().getFullYear()
             class="text-gray-600 hover:text-gray-900 dark:text-gray-400 dark:hover:text-white"
             >Risk Disclosure</RouterLink
           >
+
+          <!-- Social links -->
+          <a
+            href="https://x.com/delphimarkets_"
+            target="_blank"
+            rel="noopener noreferrer"
+            aria-label="X (formerly Twitter)"
+            class="text-gray-600 hover:text-gray-900 dark:text-gray-400 dark:hover:text-white"
+            >X</a
+          >
+          <a
+            href="https://t.me/delphimarkets"
+            target="_blank"
+            rel="noopener noreferrer"
+            aria-label="Telegram"
+            class="text-gray-600 hover:text-gray-900 dark:text-gray-400 dark:hover:text-white"
+            >Telegram</a
+          >
         </nav>
       </div>
 
