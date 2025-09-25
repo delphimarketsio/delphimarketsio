@@ -28,12 +28,14 @@ export default defineConfig({
   server: {
     proxy: {
       '/news-feed': {
-        target: 'https://www.euronews.com',
+        target: 'https://decrypt.co',
         changeOrigin: true,
-        rewrite: () => '/rss?format=mrss&level=theme&name=news',
+        rewrite: () => '/feed',
         headers: {
           // Some feeds require a user-agent; set a generic one
           'User-Agent': 'DelphiMarketsFeedProxy/1.0',
+          // Ensure correct Host header for some CDNs
+          Host: 'decrypt.co',
         },
       },
     },

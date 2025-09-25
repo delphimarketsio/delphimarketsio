@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { onMounted, ref } from 'vue'
 
-// Euronews RSS feed via local dev proxy (/news-feed configured in Vite / server).
+// Decrypt RSS feed via local dev proxy (/news-feed configured in Vite / server).
 const FEED_URL = '/news-feed'
 
 interface NewsItem {
@@ -25,14 +25,17 @@ function parseRss(xmlText: string): NewsItem[] {
     const title = node.querySelector('title')?.textContent?.trim() || 'Untitled'
     const linkEl = node.querySelector('link')
     let link = linkEl?.getAttribute('href') || linkEl?.textContent || '#'
-    if (link && !/^https?:\/\//i.test(link)) {
-      link = `https://www.euronews.com${link}`
-    }
+    // Ensure absolute URLs, but do not hardcode host (Decrypt provides absolute links)
+    if (link && link.startsWith('//')) link = 'https:' + link
     const pubDate =
       node.querySelector('pubDate')?.textContent ||
       node.querySelector('updated')?.textContent ||
       undefined
-    const description = node.querySelector('description')?.textContent || undefined
+    // Prefer full content when available (common in WordPress feeds like Decrypt)
+    const description =
+      node.querySelector('content\\:encoded')?.textContent ||
+      node.querySelector('description')?.textContent ||
+      undefined
 
     // Image extraction (best-effort): prioritize MRSS media:content / media:thumbnail
     let image: string | undefined
@@ -110,7 +113,7 @@ function formatDate(dateStr?: string) {
 <template>
   <div class="space-y-3">
     <div class="flex items-center justify-between">
-      <h2 class="text-xl font-semibold text-gray-900 dark:text-white">World News</h2>
+      <h2 class="text-xl font-semibold text-gray-900 dark:text-white">Crypto News</h2>
       <button
         class="text-xs text-[#3B82F6] hover:underline disabled:opacity-50"
         :disabled="loading"
