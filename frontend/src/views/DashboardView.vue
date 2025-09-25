@@ -429,7 +429,7 @@ const filteredBets = computed(() => filterBets(userBets.value))
             </button>
           </div>
           <div v-if="activeTab === 'trending'">
-            <TrendingMarkets />
+            <TrendingMarkets @after-action="fetchData" />
             <div
               v-if="!workspaceStore.isAuthenticated"
               class="mt-4 p-6 rounded-lg border border-dashed border-[#3B82F6]/40 bg-white dark:bg-gray-800"

@@ -41,6 +41,7 @@ interface EntryLite {
   account: {
     betId: { toNumber(): number; toString(): string }
     depositedSolAmount: { toNumber(): number }
+    isYes?: boolean
   }
 }
 
@@ -48,14 +49,15 @@ const workspace = useWorkspaceStore()
 const toast = useToastStore()
 const log = useLogger()
 const router = useRouter()
+const emit = defineEmits<{ (e: 'after-action', betId: number): void }>()
 
 const loading = ref(false)
 const pools = ref<PoolLite[]>([])
 const entriesMap = ref<Map<number, EntryLite[]>>(new Map())
 const loadError = ref<string | null>(null)
 
-// Set of betIds where the current user already has a (non-zero) position; used to exclude from trending
-const participatedBetIds = ref<Set<number>>(new Set())
+// Map of betId -> user's joined side ("Yes" | "No") for rendering joined markets correctly
+const userPositionMap = ref<Map<number, 'Yes' | 'No'>>(new Map())
 
 // Map betId -> participation state
 const miniStates = ref<Map<number, MiniParticipationState>>(new Map())
@@ -111,7 +113,9 @@ async function loadEntriesForVisible(force = false) {
       if (entriesGeneration !== myGen) return
       if (entriesMap.value.has(betId) && !force) continue
       try {
-        const es = (await workspace.getAllEntriesForBet(betId)) as unknown as EntryLite[]
+        const es = (await workspace.getAllEntriesForBet(betId, {
+          force,
+        })) as unknown as EntryLite[]
         if (entriesGeneration !== myGen) return
         entriesMap.value.set(betId, es)
       } catch (e) {
@@ -122,6 +126,33 @@ async function loadEntriesForVisible(force = false) {
     }
   } finally {
     loadingEntries = false
+  }
+}
+
+// Refresh a single market's data (pool and entries) after a user action to reflect on-chain state
+async function refreshAfterAction(betId: number) {
+  try {
+    // Force-refresh pool to get updated reserves/liquidity
+    const freshPool = (await workspace.getPoolById(betId, {
+      force: true,
+      ttlMs: 0,
+    })) as unknown as PoolLite | null
+    if (freshPool) {
+      // Replace the pool in-place to trigger reactivity without full reload
+      const idx = pools.value.findIndex((p) => p.betId.toNumber() === betId)
+      if (idx !== -1) pools.value[idx] = freshPool
+      else pools.value = [...pools.value, freshPool]
+    }
+
+    // Force-refresh entries for this bet (drives participants/volume stats)
+    const freshEntries = (await workspace.getAllEntriesForBet(betId, {
+      force: true,
+    })) as unknown as EntryLite[]
+    entriesMap.value.set(betId, freshEntries)
+    // Refresh user entries cache so other views (e.g., MyMarkets) can reflect new position promptly
+    await workspace.getUserEntries(undefined, { force: true })
+  } catch (err) {
+    log.warn('partial refresh failed after action', betId, err)
   }
 }
 
@@ -214,10 +245,11 @@ const trending = computed(() => {
       ended,
       score,
       shareUuid: p.shareUuid,
+      myPosition: userPositionMap.value.get(betId),
     }
   })
   return items
-    .filter((i) => !i.complete && !participatedBetIds.value.has(i.id))
+    .filter((i) => !i.complete)
     .sort((a, b) => b.score - a.score)
 })
 
@@ -410,11 +442,12 @@ async function quickDeposit(betId: number, side: 'Yes' | 'No') {
     toast.success('Position placed.', 'Deposit successful')
     if (side === 'Yes') state.yesAmount = ''
     else state.noAmount = ''
-    // Refresh entries lazily for this bet
-    entriesMap.value.delete(betId)
-    void loadEntriesForVisible(true)
-    // Mark this bet as participated so it is excluded from trending view
-    participatedBetIds.value = new Set([...participatedBetIds.value, betId])
+    // Update user's joined side so UI restricts to that side going forward
+    userPositionMap.value.set(betId, side)
+    // Fetch updated pool + entries from chain to reflect new state now
+    await refreshAfterAction(betId)
+    // Notify parent views (Dashboard) so MyMarkets can refetch immediately
+    emit('after-action', betId)
   } catch (e) {
     log.error('mini deposit failed', e)
     const msg = (e as Error)?.message || 'Failed to deposit'
@@ -425,23 +458,24 @@ async function quickDeposit(betId: number, side: 'Yes' | 'No') {
   }
 }
 
-// ---------------- Participation Exclusion Logic ----------------
+// ---------------- User Participation (side) Logic ----------------
 async function loadUserParticipation() {
   if (!workspace.isAuthenticated) {
-    participatedBetIds.value = new Set()
+    userPositionMap.value = new Map()
     return
   }
   try {
     const entries = (await workspace.getUserEntries()) as any[] // eslint-disable-line @typescript-eslint/no-explicit-any
-    const set = new Set<number>()
+    const map = new Map<number, 'Yes' | 'No'>()
     for (const e of entries) {
       const amt = e?.account?.depositedSolAmount?.toNumber?.() ?? 0
       if (amt > 0) {
         const id = e?.account?.betId?.toNumber?.()
-        if (typeof id === 'number') set.add(id)
+        const isYes = e?.account?.isYes === true
+        if (typeof id === 'number') map.set(id, isYes ? 'Yes' : 'No')
       }
     }
-    participatedBetIds.value = set
+    userPositionMap.value = map
   } catch (err) {
     log.warn('failed to load user participation bet IDs', err)
   }
@@ -554,71 +588,143 @@ watch(
               </CardContent>
               <CardFooter class="mt-auto">
                 <div class="w-full flex flex-col gap-2">
-                  <!-- Show quick deposit UI only if market not ended -->
-                  <div v-if="!m.ended" class="grid grid-cols-2 gap-2">
-                    <div class="flex flex-col gap-1">
-                      <label
-                        class="text-[10px] font-semibold uppercase tracking-wide text-green-600 dark:text-green-400"
-                        >Yes</label
-                      >
-                      <div class="relative">
-                        <input
-                          v-model="getMiniState(m.id).yesAmount"
-                          type="number"
-                          min="0"
-                          step="0.0001"
-                          placeholder="0.0"
-                          class="w-full px-2 py-1.5 text-xs rounded-md border border-green-300 dark:border-green-700 bg-green-50/60 dark:bg-green-900/30 focus:outline-none focus:ring-2 focus:ring-green-500/60 text-green-900 dark:text-green-100 placeholder-green-400"
-                        />
-                        <span
-                          class="absolute right-1 top-1/2 -translate-y-1/2 text-[10px] text-green-500"
-                          >SOL</span
+                  <!-- Quick deposit UI: mirror MyMarkets behavior for joined markets -->
+                  <div v-if="!m.ended">
+                    <!-- If user has a position, restrict to that side -->
+                    <div v-if="m.myPosition === 'Yes'" class="grid grid-cols-1 gap-2">
+                      <div class="flex flex-col gap-1">
+                        <label
+                          class="text-[10px] font-semibold uppercase tracking-wide text-green-600 dark:text-green-400"
+                          >Yes (add)</label
                         >
+                        <div class="relative">
+                          <input
+                            v-model="getMiniState(m.id).yesAmount"
+                            type="number"
+                            min="0"
+                            step="0.0001"
+                            placeholder="0.0"
+                            class="w-full px-2 py-1.5 text-xs rounded-md border border-green-300 dark:border-green-700 bg-green-50/60 dark:bg-green-900/30 focus:outline-none focus:ring-2 focus:ring-green-500/60 text-green-900 dark:text-green-100 placeholder-green-400"
+                          />
+                          <span
+                            class="absolute right-1 top-1/2 -translate-y-1/2 text-[10px] text-green-500"
+                            >SOL</span
+                          >
+                        </div>
+                        <Button
+                          size="sm"
+                          class="w-full text-xs bg-green-600 hover:bg-green-600/90 text-white"
+                          :disabled="
+                            getMiniState(m.id).loading ||
+                            validateAmount(getMiniState(m.id).yesAmount) !== null
+                          "
+                          @click="quickDeposit(m.id, 'Yes')"
+                        >
+                          <span v-if="!getMiniState(m.id).loading">Add Yes Stake</span>
+                          <span v-else>...</span>
+                        </Button>
                       </div>
-                      <Button
-                        size="sm"
-                        class="w-full text-xs bg-green-600 hover:bg-green-600/90 text-white"
-                        :disabled="
-                          getMiniState(m.id).loading ||
-                          validateAmount(getMiniState(m.id).yesAmount) !== null
-                        "
-                        @click="quickDeposit(m.id, 'Yes')"
-                      >
-                        <span v-if="!getMiniState(m.id).loading">Deposit Yes</span>
-                        <span v-else>...</span>
-                      </Button>
                     </div>
-                    <div class="flex flex-col gap-1">
-                      <label
-                        class="text-[10px] font-semibold uppercase tracking-wide text-red-600 dark:text-red-400"
-                        >No</label
-                      >
-                      <div class="relative">
-                        <input
-                          v-model="getMiniState(m.id).noAmount"
-                          type="number"
-                          min="0"
-                          step="0.0001"
-                          placeholder="0.0"
-                          class="w-full px-2 py-1.5 text-xs rounded-md border border-red-300 dark:border-red-700 bg-red-50/60 dark:bg-red-900/30 focus:outline-none focus:ring-2 focus:ring-red-500/60 text-red-900 dark:text-red-100 placeholder-red-400"
-                        />
-                        <span
-                          class="absolute right-1 top-1/2 -translate-y-1/2 text-[10px] text-red-500"
-                          >SOL</span
+                    <div v-else-if="m.myPosition === 'No'" class="grid grid-cols-1 gap-2">
+                      <div class="flex flex-col gap-1">
+                        <label
+                          class="text-[10px] font-semibold uppercase tracking-wide text-red-600 dark:text-red-400"
+                          >No (add)</label
                         >
+                        <div class="relative">
+                          <input
+                            v-model="getMiniState(m.id).noAmount"
+                            type="number"
+                            min="0"
+                            step="0.0001"
+                            placeholder="0.0"
+                            class="w-full px-2 py-1.5 text-xs rounded-md border border-red-300 dark:border-red-700 bg-red-50/60 dark:bg-red-900/30 focus:outline-none focus:ring-2 focus:ring-red-500/60 text-red-900 dark:text-red-100 placeholder-red-400"
+                          />
+                          <span
+                            class="absolute right-1 top-1/2 -translate-y-1/2 text-[10px] text-red-500"
+                            >SOL</span
+                          >
+                        </div>
+                        <Button
+                          size="sm"
+                          class="w-full text-xs bg-red-600 hover:bg-red-600/90 text-white"
+                          :disabled="
+                            getMiniState(m.id).loading ||
+                            validateAmount(getMiniState(m.id).noAmount) !== null
+                          "
+                          @click="quickDeposit(m.id, 'No')"
+                        >
+                          <span v-if="!getMiniState(m.id).loading">Add No Stake</span>
+                          <span v-else>...</span>
+                        </Button>
                       </div>
-                      <Button
-                        size="sm"
-                        class="w-full text-xs bg-red-600 hover:bg-red-600/90 text-white"
-                        :disabled="
-                          getMiniState(m.id).loading ||
-                          validateAmount(getMiniState(m.id).noAmount) !== null
-                        "
-                        @click="quickDeposit(m.id, 'No')"
-                      >
-                        <span v-if="!getMiniState(m.id).loading">Deposit No</span>
-                        <span v-else>...</span>
-                      </Button>
+                    </div>
+                    <!-- If no position, show both sides -->
+                    <div v-else class="grid grid-cols-2 gap-2">
+                      <div class="flex flex-col gap-1">
+                        <label
+                          class="text-[10px] font-semibold uppercase tracking-wide text-green-600 dark:text-green-400"
+                          >Yes</label
+                        >
+                        <div class="relative">
+                          <input
+                            v-model="getMiniState(m.id).yesAmount"
+                            type="number"
+                            min="0"
+                            step="0.0001"
+                            placeholder="0.0"
+                            class="w-full px-2 py-1.5 text-xs rounded-md border border-green-300 dark:border-green-700 bg-green-50/60 dark:bg-green-900/30 focus:outline-none focus:ring-2 focus:ring-green-500/60 text-green-900 dark:text-green-100 placeholder-green-400"
+                          />
+                          <span
+                            class="absolute right-1 top-1/2 -translate-y-1/2 text-[10px] text-green-500"
+                            >SOL</span
+                          >
+                        </div>
+                        <Button
+                          size="sm"
+                          class="w-full text-xs bg-green-600 hover:bg-green-600/90 text-white"
+                          :disabled="
+                            getMiniState(m.id).loading ||
+                            validateAmount(getMiniState(m.id).yesAmount) !== null
+                          "
+                          @click="quickDeposit(m.id, 'Yes')"
+                        >
+                          <span v-if="!getMiniState(m.id).loading">Deposit Yes</span>
+                          <span v-else>...</span>
+                        </Button>
+                      </div>
+                      <div class="flex flex-col gap-1">
+                        <label
+                          class="text-[10px] font-semibold uppercase tracking-wide text-red-600 dark:text-red-400"
+                          >No</label
+                        >
+                        <div class="relative">
+                          <input
+                            v-model="getMiniState(m.id).noAmount"
+                            type="number"
+                            min="0"
+                            step="0.0001"
+                            placeholder="0.0"
+                            class="w-full px-2 py-1.5 text-xs rounded-md border border-red-300 dark:border-red-700 bg-red-50/60 dark:bg-red-900/30 focus:outline-none focus:ring-2 focus:ring-red-500/60 text-red-900 dark:text-red-100 placeholder-red-400"
+                          />
+                          <span
+                            class="absolute right-1 top-1/2 -translate-y-1/2 text-[10px] text-red-500"
+                            >SOL</span
+                          >
+                        </div>
+                        <Button
+                          size="sm"
+                          class="w-full text-xs bg-red-600 hover:bg-red-600/90 text-white"
+                          :disabled="
+                            getMiniState(m.id).loading ||
+                            validateAmount(getMiniState(m.id).noAmount) !== null
+                          "
+                          @click="quickDeposit(m.id, 'No')"
+                        >
+                          <span v-if="!getMiniState(m.id).loading">Deposit No</span>
+                          <span v-else>...</span>
+                        </Button>
+                      </div>
                     </div>
                   </div>
                   <!-- If ended (but not complete), show info instead of deposit UI -->
